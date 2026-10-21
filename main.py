@@ -49,32 +49,43 @@ async def procesar_factura(
             
         documento.close()
 
-        # 2. Prompt estricto
+        # 2. Prompt estricto y adaptado a la base de datos relacional
         prompt = """
-        Eres Vectia IA, un sistema de extracción de datos de servicios públicos para Colombia.
-        Analiza las imágenes adjuntas de esta factura. Devuelve ÚNICAMENTE un objeto JSON válido.
-        El JSON debe contener dos llaves principales ("factura" y "consumo_medidor") que coinciden exactamente con la estructura de la base de datos relacional.
-        Respeta los tipos de datos: si un valor numérico no existe usa null, usa formato YYYY-MM-DD para fechas.
+        Eres Vectia IA, un motor experto en extracción estructurada de facturas de servicios públicos en Colombia (energía, acueducto, gas).
+        Analiza visualmente todas las páginas de la factura adjunta y extrae la información requerida.
         
-        ESTRUCTURA EXACTA REQUERIDA:
+        REGLAS ESTRICTAS DE EXTRACCIÓN:
+        1. Formato numérico: Extrae valores monetarios y de consumo como números flotantes o enteros puros (sin símbolos $, sin puntos de mil, usa punto únicamente para decimales si aplica). Ejemplo: si dice "$123.830", devuelve 123830.00.
+        2. Formato de fechas: Convierte todas las fechas al formato estricto ISO "YYYY-MM-DD". Traduce meses en texto (ej. "03 JUL/2026" -> "2026-07-03"). Si no existe el año, asume el año del periodo.
+        3. Clasificación: "tipo_servicio" debe ser normalizado en minúsculas: "energia", "agua" o "gas".
+        4. Multimedidor: "medidores" debe ser SIEMPRE un arreglo (lista), incluso si la factura solo tiene un medidor.
+        5. Detalles adicionales: 
+           - En "factura.detalles_adicionales", extrae en un JSON rubros como: cobro_aseo, estrato, subsidio, contribucion, alumbrado_publico, intereses_mora, etc.
+           - En "medidores.detalles_adicionales", incluye datos técnicos propios del medidor si existen: energia_reactiva, factor_multiplicador, lectura_actual, lectura_anterior.
+        6. Devuelve ÚNICAMENTE un JSON válido con la siguiente estructura.
+
+        ESTRUCTURA JSON REQUERIDA:
         {
           "factura": {
-            "tipo_servicio": "Energía o Acueducto",
-            "proveedor": "Nombre de la empresa",
-            "numero_factura": "Número de la factura",
-            "numero_cliente": "Número de cuenta o cliente",
-            "valor_total": 0, 
-            "periodo_inicio": "YYYY-MM-DD",
-            "periodo_fin": "YYYY-MM-DD",
-            "fecha_vencimiento": "YYYY-MM-DD",
-            "estado_pago": "pendiente"
+            "tipo_servicio": "energia",
+            "proveedor": "string (ej. Enel Colombia, Acueducto de Bogotá, Vanti)",
+            "numero_factura": "string",
+            "numero_cliente": "string (cuenta contrato, número de cliente o referencia de pago)",
+            "valor_total": 0.0,
+            "periodo_inicio": "YYYY-MM-DD o null",
+            "periodo_fin": "YYYY-MM-DD o null",
+            "fecha_vencimiento": "YYYY-MM-DD o null",
+            "estado_pago": "pendiente",
+            "detalles_adicionales": {}
           },
-          "consumo_medidor": {
-            "numero_medidor": "Número serial del medidor",
-            "consumo": 0.0,
-            "unidad_medida": "kWh o m3 o unidad correspondiente",
-            "detalles_adicionales": {} 
-          }
+          "medidores": [
+            {
+              "numero_medidor": "string con el serial",
+              "consumo": 0.0,
+              "unidad_medida": "kWh",
+              "detalles_adicionales": {}
+            }
+          ]
         }
         """
 
@@ -99,6 +110,8 @@ async def procesar_factura(
         datos_extraidos = json.loads(respuesta.choices[0].message.content)
 
         # 4. Inserciones en la Base de Datos (Supabase)
+        
+        # 4.1 Insertar la tabla padre (Facturas)
         datos_factura = datos_extraidos["factura"]
         datos_factura["id_usuario"] = id_usuario
 
@@ -109,15 +122,25 @@ async def procesar_factura(
             
         id_factura_generado = resultado_factura.data[0]["id"]
 
-        datos_consumo = datos_extraidos["consumo_medidor"]
-        datos_consumo["id_factura"] = id_factura_generado
+        # 4.2 Insertar la tabla hija (Consumos Medidores)
+        lista_medidores = datos_extraidos.get("medidores", [])
+        
+        if lista_medidores:
+            # Asignar el ID de la factura a cada medidor extraído
+            for medidor in lista_medidores:
+                medidor["id_factura"] = id_factura_generado
 
-        supabase.table("consumos_medidores").insert(datos_consumo).execute()
+            # Supabase permite la inserción de listas de diccionarios en bloque (Batch Insert)
+            resultado_medidores = supabase.table("consumos_medidores").insert(lista_medidores).execute()
+            
+            if not resultado_medidores.data:
+                # Opcional: Podrías hacer un rollback manual borrando la factura si fallan los medidores
+                print("Advertencia: No se pudieron insertar los medidores asociados.")
 
-        # 5. Retornar solo confirmación (SIN enviar el JSON completo)
+        # 5. Retornar confirmación
         return {
             "status": "success",
-            "mensaje": "Factura procesada y guardada en base de datos correctamente",
+            "mensaje": f"Factura procesada y guardada correctamente con {len(lista_medidores)} medidor(es).",
             "id_factura": id_factura_generado
         }
 
