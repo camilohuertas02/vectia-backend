@@ -1,6 +1,7 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Request
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Form, Query
 from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import APIKeyHeader
 from openai import AsyncOpenAI
 from supabase import create_client, Client
 from fpdf import FPDF
@@ -29,56 +30,32 @@ if supabase_url and supabase_key:
 openai_client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 
 # ==========================================
-# FUNCIÓN DE SEGURIDAD MAESTRA (JWT Auth)
+# SEGURIDAD SERVIDOR A SERVIDOR (API KEY)
 # ==========================================
-async def obtener_usuario_seguro(request: Request) -> int:
-    """
-    Extrae el JWT de las cabeceras, lo valida con Supabase y 
-    retorna el ID (entero) del usuario desde la tabla 'users'.
-    """
-    auth_header = request.headers.get("Authorization")
-    if not auth_header or not auth_header.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Token de acceso faltante o inválido")
-    
-    token = auth_header.split(" ")[1]
-    
-    try:
-        # 1. Validamos el token directamente con Supabase Auth
-        user_response = supabase.auth.get_user(token)
-        if not user_response.user:
-            raise HTTPException(status_code=401, detail="Sesión expirada o inválida")
-        
-        user_email = user_response.user.email
+api_key_header = APIKeyHeader(name="X-API-KEY")
 
-        # 2. Buscamos el ID entero en la tabla 'users' usando el email
-        db_user = supabase.table("users").select("id").eq("email", user_email).execute()
-        
-        if not db_user.data:
-            raise HTTPException(status_code=404, detail="Usuario no registrado en la base de datos principal")
-            
-        return db_user.data[0]["id"]
-        
-    except Exception as e:
-        raise HTTPException(status_code=401, detail=f"Error de autenticación: {str(e)}")
+async def verify_api_key(api_key: str = Depends(api_key_header)):
+    # Define esta variable de entorno en Render. Ej: "vectia_secreto_123"
+    SECRET_KEY = os.environ.get("VECTIA_BACKEND_SECRET") 
+    
+    if api_key != SECRET_KEY:
+        raise HTTPException(status_code=403, detail="Acceso denegado: API KEY inválida")
+    return api_key
 
 
 # ==========================================
-# ENDPOINT 1: SUBIDA Y EXTRACCIÓN (Seguro)
+# ENDPOINT 1: SUBIDA Y EXTRACCIÓN
 # ==========================================
 @app.post("/api/procesar-factura")
 async def procesar_factura(
-    request: Request,
-    archivo: UploadFile = File(...) 
-    # Eliminamos id_usuario: int = Form(...) porque ahora viene seguro en el Request
+    archivo: UploadFile = File(...),
+    id_usuario: int = Form(...), # Next.js inyectará esto de forma segura
+    api_key: str = Depends(verify_api_key)
 ):
     if not archivo.filename.lower().endswith('.pdf'):
         raise HTTPException(status_code=400, detail="El archivo debe ser un PDF")
 
     try:
-        # 1. Autenticar y obtener ID
-        id_usuario = await obtener_usuario_seguro(request)
-
-        # 2. Transformar PDF a Imágenes en Memoria
         contenido_pdf = await archivo.read()
         documento = fitz.open(stream=contenido_pdf, filetype="pdf")
         
@@ -89,7 +66,6 @@ async def procesar_factura(
             imagenes_base64.append(img_b64)
         documento.close()
 
-        # 3. Prompt estricto con las nuevas columnas espaciales
         prompt = """
         Eres Vectia IA, experto en extracción estructurada de facturas de servicios públicos en Colombia.
         REGLAS:
@@ -97,7 +73,7 @@ async def procesar_factura(
         2. Fechas: Formato ISO "YYYY-MM-DD".
         3. "tipo_servicio": "energia", "agua" o "gas".
         4. "medidores" es SIEMPRE un arreglo.
-        5. Separa claramente la dirección de la sede y la ciudad basándote en la información del cliente.
+        5. Separa la dirección de la sede y la ciudad basándote en la información del cliente.
         
         ESTRUCTURA:
         {
@@ -106,8 +82,8 @@ async def procesar_factura(
             "proveedor": "string",
             "numero_factura": "string",
             "numero_cliente": "string",
-            "direccion_sede": "string (Solo la nomenclatura de la dirección)",
-            "ciudad": "string (Solo la ciudad o municipio)",
+            "direccion_sede": "string (Solo la nomenclatura)",
+            "ciudad": "string",
             "valor_total": 0.0,
             "periodo_inicio": "YYYY-MM-DD o null",
             "periodo_fin": "YYYY-MM-DD o null",
@@ -130,7 +106,6 @@ async def procesar_factura(
         for img in imagenes_base64:
             mensajes.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img}", "detail": "high"}})
 
-        # 4. Invocación al LLM
         respuesta = await openai_client.chat.completions.create(
             model="gpt-4o-mini",
             response_format={"type": "json_object"},
@@ -140,7 +115,6 @@ async def procesar_factura(
 
         datos_extraidos = json.loads(respuesta.choices[0].message.content)
 
-        # 5. Guardado en Supabase (Factura y luego Medidores)
         datos_factura = datos_extraidos["factura"]
         datos_factura["id_usuario"] = id_usuario
         res_factura = supabase.table("facturas").insert(datos_factura).execute()
@@ -153,38 +127,34 @@ async def procesar_factura(
 
         return {"status": "success", "id_factura": id_factura}
 
-    except HTTPException:
-        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 # ==========================================
-# ENDPOINT 2: DATOS PARA EL DASHBOARD (Seguro)
+# ENDPOINT 2: DATOS PARA EL DASHBOARD
 # ==========================================
 @app.get("/api/analytics")
-async def obtener_analiticas(request: Request):
+async def obtener_analiticas(
+    id_usuario: int = Query(...), 
+    api_key: str = Depends(verify_api_key)
+):
     try:
-        id_usuario = await obtener_usuario_seguro(request)
         res = supabase.table("facturas").select("*, consumos_medidores(*)").eq("id_usuario", id_usuario).execute()
-        
-        return {
-            "status": "success",
-            "data": res.data
-        }
-    except HTTPException:
-        raise
+        return {"status": "success", "data": res.data}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 # ==========================================
-# ENDPOINT 3: GENERACIÓN DE INFORME PDF (Seguro)
+# ENDPOINT 3: GENERACIÓN DE INFORME PDF
 # ==========================================
 @app.get("/api/informe-pdf")
-async def generar_informe_pdf(request: Request):
+async def generar_informe_pdf(
+    id_usuario: int = Query(...), 
+    api_key: str = Depends(verify_api_key)
+):
     try:
-        id_usuario = await obtener_usuario_seguro(request)
         res = supabase.table("facturas").select("*, consumos_medidores(*)").eq("id_usuario", id_usuario).execute()
         facturas = res.data
 
@@ -194,13 +164,10 @@ async def generar_informe_pdf(request: Request):
         gasto_total = sum(f.get("valor_total", 0) for f in facturas)
         total_sedes = len(set(f.get("direccion_sede") for f in facturas if f.get("direccion_sede")))
 
-        # Construcción del PDF
         pdf = FPDF()
         pdf.add_page()
-        
         pdf.set_font("Helvetica", style="B", size=20)
         pdf.cell(0, 15, "Reporte Analitico - Vectia Enterprise", ln=True, align="C")
-        
         pdf.set_font("Helvetica", size=10)
         pdf.cell(0, 10, f"Fecha de generacion: {datetime.now().strftime('%Y-%m-%d %H:%M')}", ln=True, align="C")
         pdf.ln(10)
@@ -213,7 +180,7 @@ async def generar_informe_pdf(request: Request):
         pdf.ln(10)
 
         pdf.set_font("Helvetica", style="B", size=12)
-        pdf.cell(0, 10, "Desglose por Servicio Registrado", ln=True)
+        pdf.cell(0, 10, "Desglose por Servicio", ln=True)
         
         pdf.set_font("Helvetica", style="B", size=9)
         pdf.cell(30, 10, "Servicio", border=1)
@@ -238,15 +205,7 @@ async def generar_informe_pdf(request: Request):
         pdf.cell(0, 10, "Generado automaticamente por Inteligencia Artificial Vectia.", ln=True, align="C")
 
         pdf_bytes = pdf.output(dest="S").encode("latin-1")
-        
-        return Response(
-            content=pdf_bytes,
-            media_type="application/pdf",
-            headers={"Content-Disposition": "attachment; filename=informe_vectia.pdf"}
-        )
+        return Response(content=pdf_bytes, media_type="application/pdf", headers={"Content-Disposition": "attachment; filename=informe_vectia.pdf"})
 
-    except HTTPException:
-        raise
     except Exception as e:
-        print("Error generando PDF:", str(e))
         raise HTTPException(status_code=500, detail="Error generando el informe PDF")
