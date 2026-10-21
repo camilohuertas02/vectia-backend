@@ -74,8 +74,9 @@ async def procesar_factura(
         3. "tipo_servicio": "energia", "agua" o "gas".
         4. "medidores" es SIEMPRE un arreglo.
         5. Separa la dirección de la sede y la ciudad basándote en la información del cliente.
+        6. Devuelve ÚNICAMENTE un objeto JSON válido.
         
-        ESTRUCTURA:
+        ESTRUCTURA JSON ESPERADA:
         {
           "factura": {
             "tipo_servicio": "energia",
