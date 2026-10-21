@@ -5,9 +5,12 @@ certifi==2026.10.19
 cffi==2.1.1
 click==8.5.0
 cryptography==50.0.2
+defusedxml==0.7.1
 deprecation==2.1.0
 fastapi==0.156.2
 flatbuffers==25.12.19
+fonttools==4.67.0
+fpdf2==2.8.9
 h11==0.16.0
 h2==4.4.1
 hpack==4.2.0
@@ -25,6 +28,7 @@ onnxruntime==1.31.0
 openai==3.35.1
 opentelemetry-api==1.45.1
 packaging==26.3
+pillow==13.0.0
 postgrest==2.33.0
 propcache==0.5.4
 protobuf==7.36.2
