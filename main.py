@@ -1,12 +1,13 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Form, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader
-from openai import AsyncOpenAI
+from anthropic import AsyncAnthropic
 from supabase import create_client, Client
 import fitz  # PyMuPDF
 import base64
 import json
 import os
+import re
 
 app = FastAPI()
 
@@ -24,24 +25,16 @@ supabase_key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 if supabase_url and supabase_key:
     supabase: Client = create_client(supabase_url, supabase_key)
 
-openai_client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+anthropic_client = AsyncAnthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 
-# ==========================================
-# SEGURIDAD SERVIDOR A SERVIDOR (API KEY)
-# ==========================================
 api_key_header = APIKeyHeader(name="X-API-KEY")
 
 async def verify_api_key(api_key: str = Depends(api_key_header)):
     SECRET_KEY = os.environ.get("VECTIA_BACKEND_SECRET") 
-    
     if api_key != SECRET_KEY:
         raise HTTPException(status_code=403, detail="Acceso denegado: API KEY inválida")
     return api_key
 
-
-# ==========================================
-# ENDPOINT 1: SUBIDA Y EXTRACCIÓN CON IA
-# ==========================================
 @app.post("/api/procesar-factura")
 async def procesar_factura(
     archivo: UploadFile = File(...),
@@ -52,115 +45,146 @@ async def procesar_factura(
         raise HTTPException(status_code=400, detail="El archivo debe ser un PDF")
 
     try:
+        # Renderizado a 150 DPI para precisión visual absoluta
         contenido_pdf = await archivo.read()
         documento = fitz.open(stream=contenido_pdf, filetype="pdf")
         
         imagenes_base64 = []
         for pagina in documento:
-            pixmap = pagina.get_pixmap(dpi=90)
+            pixmap = pagina.get_pixmap(dpi=150)
             img_b64 = base64.b64encode(pixmap.tobytes("jpeg")).decode('utf-8')
             imagenes_base64.append(img_b64)
         documento.close()
 
-        prompt = """
-        Eres Vectia IA, un auditor financiero y energético experto en la normativa de servicios públicos de Colombia (CREG, CRA, SSPD).
-        Tu misión es analizar facturas (energía, acueducto, gas natural) y extraer los datos con precisión contable absoluta, ignorando la publicidad.
+        # MEGA-PROMPT DE AUDITORÍA (MÓDULO B2B ENTERPRISE)
+        prompt_sistema = """
+        Eres Vectia IA, un auditor financiero, energético y normativo experto en servicios públicos de Colombia (CREG, CRA, SSPD).
+        Analiza las imágenes de la factura provista y extrae la información cumpliendo ESTRICTAMENTE estas reglas. 
 
-        REGLAS ESTRICTAS DE EXTRACCIÓN Y AUDITORÍA (CERO ALUCINACIONES):
-        1. CLASIFICACIÓN INICIAL: Determina si el recibo es de "energia", "agua" o "gas".
-        
-        2. IDENTIFICACIÓN PRECISA (¡CRÍTICO! NO CONFUNDIR TÉRMINOS):
-           - "proveedor": El nombre de la empresa prestadora (Ej: "Enel Colombia", "EPM", "Vanti", "Triple A"). Búscalo en el logo superior o junto al NIT. Jamás lo inventes.
-           - "numero_factura": Es el consecutivo fiscal del recibo. Busca textos exactos como "DOCUMENTO EQUIVALENTE ELECTRONICO No." o "Factura de Venta No.". ¡NO es el número de cliente ni el medidor!
-           - "numero_cliente": Es la cuenta, contrato recurrente o número de suscriptor. Busca "No. Cuenta", "Número de cliente", "NIC" o "NIU".
-           - "numero_medidor" (dentro de medidores): Busca "No. Medidor", "Medidor" o "Aparato". ¡Es la máquina física, no la factura!
-        
-        3. SANITIZACIÓN FINANCIERA: Extrae los valores netos sin símbolos '$' ni separadores de miles (,). Usa punto (.) estrictamente para decimales.
-        
-        4. DIRECCIÓN Y CIUDAD: Separa la nomenclatura de la sede de la ciudad (Ej. Dirección: "CR 51 167 50", Ciudad: "Bogotá").
-        
-        5. FECHAS: Usa estrictamente el formato ISO "YYYY-MM-DD". Si no es deducible, devuelve null.
+        REGLAS DE ESTANDARIZACIÓN (¡CRÍTICO!):
+        1. "tipo_servicio": Únicamente puede ser "energia", "agua", o "gas".
+        2. "proveedor": Debe ser el nombre comercial estandarizado. Opciones permitidas: 
+           "Enel Colombia", "EPM", "Vanti", "Triple A", "Air-e", "Afinia", "Celsia", "Gases del Caribe", "Gases de Occidente", "EAAB".
+           Si el logo dice "enel", asigna "Enel Colombia".
+        3. "unidad_medida": Para energia SIEMPRE es "kWh". Para agua y gas SIEMPRE es "m3".
 
-        6. REGLAS DE AUDITORÍA (MÓDULO DE ALERTAS):
-           Evalúa minuciosamente los conceptos facturados e inyecta alertas en el objeto 'detalles_adicionales' SOLO si existen:
-           - Si el servicio es ENERGÍA: Busca activamente recargos por "Energía Reactiva" (CREG 015), "Penalización", "Contribución de Solidaridad" (Ley 142) o "Recargo estrato comercial". Si existen, márcalos como true.
-           - Si el servicio es AGUA: Busca "Recargo por exceso de consumo", "Cobro por vertimientos" o "Servicio de Aseo" si está unificado.
-           - Si el servicio es GAS: Busca "Revisión técnica obligatoria" o "Penalizaciones por reconexión".
+        REGLAS DE AISLAMIENTO FINANCIERO (LOS 3 COSTOS):
+        No uses símbolos de moneda ni separadores de miles. Usa punto para decimales.
+        1. "costo_servicio_core": El costo neto del consumo de energía/agua/gas (incluyendo subsidios o contribuciones de ley propios del servicio).
+        2. "cargos_terceros": Costos ajenos al core como "Total aseo", "Área Limpia", recolección de basuras, alumbrado público, cuotas de créditos (Ej. Credigolazo) o seguros. Si no hay, es 0.
+        3. "valor_total": El gran total a pagar en la factura. Matemáticamente, costo_servicio_core + cargos_terceros debe aproximarse al valor_total.
 
-        ESTRUCTURA JSON ESTRICTA:
+        EXTRACCIÓN OPERATIVA:
+        - "dias_facturados": Busca "Días facturados", "Días de consumo", o calcula la diferencia entre lectura actual y anterior si aplica. Número entero.
+        - "numero_factura": El consecutivo fiscal (Ej: DOCUMENTO EQUIVALENTE No. 399...).
+        - "numero_cliente": El NIC, Cuenta, o Número de Cliente.
+        - "periodo_inicio" y "periodo_fin": Formato "YYYY-MM-DD".
+
+        MÓDULO INSPECTOR Y ALERTAS REGULATORIAS (detalles_adicionales):
+        Busca cobros específicos y asigna su VALOR EXACTO (número). Si no existe el cobro, asigna 0.0.
+        - "costo_energia_reactiva_cop": Busca "Energía Reactiva", "Reactiva Inductiva/Capacitiva" (Resolución CREG 015).
+        - "costo_contribucion_solidaridad_cop": Recargo estipulado por Ley 142 para estratos comerciales/industriales.
+        - "costo_aseo_cop": El valor facturado exclusivamente por aseo/recolección de basura.
+        - "costo_alumbrado_publico_cop": El valor por alumbrado público.
+
+        DEVUELVE ÚNICAMENTE UN JSON CON LA SIGUIENTE ESTRUCTURA ESTRICTA:
         {
           "factura": {
             "tipo_servicio": "energia",
-            "proveedor": "string (Ej: Enel Colombia)",
-            "numero_factura": "string (El consecutivo del documento fiscal)",
-            "numero_cliente": "string (El número de cuenta/NIC)",
+            "proveedor": "Enel Colombia",
+            "numero_factura": "string",
+            "numero_cliente": "string",
             "direccion_sede": "string",
             "ciudad": "string",
+            "dias_facturados": 30,
+            "costo_servicio_core": 0.0,
+            "cargos_terceros": 0.0,
             "valor_total": 0.0,
             "periodo_inicio": "YYYY-MM-DD",
             "periodo_fin": "YYYY-MM-DD",
             "detalles_adicionales": {
-                // Genera dinámicamente estas claves solo si detectas las anomalías, con valor boolean true
-                "alerta_energia_reactiva": boolean,
-                "cobro_contribucion_solidaridad": boolean,
-                "recargo_exceso_consumo": boolean
+                "costo_energia_reactiva_cop": 0.0,
+                "costo_contribucion_solidaridad_cop": 0.0,
+                "costo_aseo_cop": 0.0,
+                "costo_alumbrado_publico_cop": 0.0
             }
           },
           "medidores": [
             {
-              "numero_medidor": "string (Si no hay medidor explícito, usa 'MED-UNICO')",
+              "numero_medidor": "string o 'MED-UNICO'",
               "consumo": 0.0,
-              "unidad_medida": "kWh",
-              "detalles_adicionales": {}
+              "unidad_medida": "kWh"
             }
           ]
         }
         """
 
-        mensajes = [{"type": "text", "text": prompt}]
+        contenido_mensaje = []
         for img in imagenes_base64:
-            mensajes.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img}", "detail": "auto"}})
+            contenido_mensaje.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/jpeg",
+                    "data": img
+                }
+            })
+        
+        contenido_mensaje.append({
+            "type": "text",
+            "text": "Procesa la factura y devuelve EXCLUSIVAMENTE el objeto JSON estructurado."
+        })
 
-        respuesta = await openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            response_format={"type": "json_object"},
-            messages=[{"role": "user", "content": mensajes}],
-            temperature=0.1
+        # Ejecución Claude 3.5 Sonnet
+        respuesta = await anthropic_client.messages.create(
+            model="claude-3-5-sonnet-20241022",
+            max_tokens=2500,
+            temperature=0.0,
+            system=prompt_sistema,
+            messages=[{"role": "user", "content": contenido_mensaje}]
         )
 
-        datos_extraidos = json.loads(respuesta.choices[0].message.content)
+        texto_crudo = respuesta.content[0].text
+        texto_json = re.sub(r'```(?:json)?|```', '', texto_crudo).strip()
+        
+        datos_extraidos = json.loads(texto_json)
 
+        # Inserción en Base de Datos
         datos_factura = datos_extraidos["factura"]
         datos_factura["id_usuario"] = id_usuario
+        
+        # Validar y limpiar campos si es necesario a nivel Python
         res_factura = supabase.table("facturas").insert(datos_factura).execute()
         id_factura = res_factura.data[0]["id"]
 
         lista_medidores = datos_extraidos.get("medidores", [])
         if lista_medidores:
-            for m in lista_medidores: m["id_factura"] = id_factura
+            for m in lista_medidores: 
+                m["id_factura"] = id_factura
             supabase.table("consumos_medidores").insert(lista_medidores).execute()
 
         return {
             "status": "success", 
             "id_factura": id_factura,
             "proveedor": datos_factura.get("proveedor"),
-            "numero_factura": datos_factura.get("numero_factura"),
-            "detalles_adicionales": datos_factura.get("detalles_adicionales", {})
+            "kpis_financieros": {
+                "core": datos_factura.get("costo_servicio_core"),
+                "terceros": datos_factura.get("cargos_terceros"),
+                "total": datos_factura.get("valor_total")
+            },
+            "alertas_financieras": datos_factura.get("detalles_adicionales", {})
         }
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
-# ==========================================
-# ENDPOINT 2: DATOS PARA EL DASHBOARD
-# ==========================================
 @app.get("/api/analytics")
 async def obtener_analiticas(
     id_usuario: int = Query(...), 
     api_key: str = Depends(verify_api_key)
 ):
     try:
+        # Traemos toda la data de facturas y los medidores asociados
         res = supabase.table("facturas").select("*, consumos_medidores(*)").eq("id_usuario", id_usuario).execute()
         return {"status": "success", "data": res.data}
     except Exception as e:
