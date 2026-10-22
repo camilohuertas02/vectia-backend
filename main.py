@@ -61,7 +61,7 @@ async def procesar_factura(
         
         imagenes_base64 = []
         for pagina in documento:
-            pixmap = pagina.get_pixmap(dpi=150)
+            pixmap = pagina.get_pixmap(dpi=90)
             img_b64 = base64.b64encode(pixmap.tobytes("jpeg")).decode('utf-8')
             imagenes_base64.append(img_b64)
         documento.close()
@@ -105,7 +105,7 @@ async def procesar_factura(
 
         mensajes = [{"type": "text", "text": prompt}]
         for img in imagenes_base64:
-            mensajes.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img}", "detail": "high"}})
+            mensajes.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img}", "detail": "auto"}})
 
         respuesta = await openai_client.chat.completions.create(
             model="gpt-4o-mini",
