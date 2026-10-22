@@ -32,7 +32,6 @@ openai_client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 api_key_header = APIKeyHeader(name="X-API-KEY")
 
 async def verify_api_key(api_key: str = Depends(api_key_header)):
-    # Define esta variable de entorno en tu servidor (Render/Railway)
     SECRET_KEY = os.environ.get("VECTIA_BACKEND_SECRET") 
     
     if api_key != SECRET_KEY:
@@ -53,7 +52,6 @@ async def procesar_factura(
         raise HTTPException(status_code=400, detail="El archivo debe ser un PDF")
 
     try:
-        # 1. Leer y rasterizar PDF
         contenido_pdf = await archivo.read()
         documento = fitz.open(stream=contenido_pdf, filetype="pdf")
         
@@ -64,18 +62,26 @@ async def procesar_factura(
             imagenes_base64.append(img_b64)
         documento.close()
 
-
         prompt = """
         Eres Vectia IA, un auditor financiero y energético experto en la normativa de servicios públicos de Colombia (CREG, CRA, SSPD).
-        Tu misión es analizar facturas (energía, acueducto, gas natural) y extraer los datos con precisión contable, ignorando la publicidad.
+        Tu misión es analizar facturas (energía, acueducto, gas natural) y extraer los datos con precisión contable absoluta, ignorando la publicidad.
 
-        REGLAS DE EXTRACCIÓN Y AUDITORÍA:
+        REGLAS ESTRICTAS DE EXTRACCIÓN Y AUDITORÍA (CERO ALUCINACIONES):
         1. CLASIFICACIÓN INICIAL: Determina si el recibo es de "energia", "agua" o "gas".
-        2. SANITIZACIÓN FINANCIERA: Extrae los valores netos sin símbolos '$' ni separadores de miles (,). Usa punto (.) estrictamente para decimales.
-        3. DIRECCIÓN Y CIUDAD: Separa la nomenclatura de la sede de la ciudad (Ej. Dirección: "CR 51 167 50", Ciudad: "Bogotá").
-        4. FECHAS: Usa estrictamente el formato ISO "YYYY-MM-DD". Si no es deducible, devuelve null.
+        
+        2. IDENTIFICACIÓN PRECISA (¡CRÍTICO! NO CONFUNDIR TÉRMINOS):
+           - "proveedor": El nombre de la empresa prestadora (Ej: "Enel Colombia", "EPM", "Vanti", "Triple A"). Búscalo en el logo superior o junto al NIT. Jamás lo inventes.
+           - "numero_factura": Es el consecutivo fiscal del recibo. Busca textos exactos como "DOCUMENTO EQUIVALENTE ELECTRONICO No." o "Factura de Venta No.". ¡NO es el número de cliente ni el medidor!
+           - "numero_cliente": Es la cuenta, contrato recurrente o número de suscriptor. Busca "No. Cuenta", "Número de cliente", "NIC" o "NIU".
+           - "numero_medidor" (dentro de medidores): Busca "No. Medidor", "Medidor" o "Aparato". ¡Es la máquina física, no la factura!
+        
+        3. SANITIZACIÓN FINANCIERA: Extrae los valores netos sin símbolos '$' ni separadores de miles (,). Usa punto (.) estrictamente para decimales.
+        
+        4. DIRECCIÓN Y CIUDAD: Separa la nomenclatura de la sede de la ciudad (Ej. Dirección: "CR 51 167 50", Ciudad: "Bogotá").
+        
+        5. FECHAS: Usa estrictamente el formato ISO "YYYY-MM-DD". Si no es deducible, devuelve null.
 
-        5. REGLAS DE AUDITORÍA (MÓDULO DE ALERTAS):
+        6. REGLAS DE AUDITORÍA (MÓDULO DE ALERTAS):
            Evalúa minuciosamente los conceptos facturados e inyecta alertas en el objeto 'detalles_adicionales' SOLO si existen:
            - Si el servicio es ENERGÍA: Busca activamente recargos por "Energía Reactiva" (CREG 015), "Penalización", "Contribución de Solidaridad" (Ley 142) o "Recargo estrato comercial". Si existen, márcalos como true.
            - Si el servicio es AGUA: Busca "Recargo por exceso de consumo", "Cobro por vertimientos" o "Servicio de Aseo" si está unificado.
@@ -85,9 +91,9 @@ async def procesar_factura(
         {
           "factura": {
             "tipo_servicio": "energia",
-            "proveedor": "string",
-            "numero_factura": "string",
-            "numero_cliente": "string",
+            "proveedor": "string (Ej: Enel Colombia)",
+            "numero_factura": "string (El consecutivo del documento fiscal)",
+            "numero_cliente": "string (El número de cuenta/NIC)",
             "direccion_sede": "string",
             "ciudad": "string",
             "valor_total": 0.0,
@@ -111,12 +117,10 @@ async def procesar_factura(
         }
         """
 
-
         mensajes = [{"type": "text", "text": prompt}]
         for img in imagenes_base64:
             mensajes.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img}", "detail": "auto"}})
 
-        # 3. Invocación al LLM
         respuesta = await openai_client.chat.completions.create(
             model="gpt-4o-mini",
             response_format={"type": "json_object"},
@@ -126,7 +130,6 @@ async def procesar_factura(
 
         datos_extraidos = json.loads(respuesta.choices[0].message.content)
 
-        # 4. Inserción en Supabase
         datos_factura = datos_extraidos["factura"]
         datos_factura["id_usuario"] = id_usuario
         res_factura = supabase.table("facturas").insert(datos_factura).execute()
@@ -137,7 +140,6 @@ async def procesar_factura(
             for m in lista_medidores: m["id_factura"] = id_factura
             supabase.table("consumos_medidores").insert(lista_medidores).execute()
 
-        # 5. Respuesta para el Frontend (Necesario para el renombramiento de archivo inteligente)
         return {
             "status": "success", 
             "id_factura": id_factura,
