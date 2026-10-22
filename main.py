@@ -1,15 +1,12 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Form, Query
-from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader
 from openai import AsyncOpenAI
 from supabase import create_client, Client
-from fpdf import FPDF
 import fitz  # PyMuPDF
 import base64
 import json
 import os
-from datetime import datetime
 
 app = FastAPI()
 
@@ -35,7 +32,7 @@ openai_client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 api_key_header = APIKeyHeader(name="X-API-KEY")
 
 async def verify_api_key(api_key: str = Depends(api_key_header)):
-    # Define esta variable de entorno en Render. Ej: "vectia_secreto_123"
+    # Define esta variable de entorno en tu servidor (Render/Railway)
     SECRET_KEY = os.environ.get("VECTIA_BACKEND_SECRET") 
     
     if api_key != SECRET_KEY:
@@ -44,18 +41,19 @@ async def verify_api_key(api_key: str = Depends(api_key_header)):
 
 
 # ==========================================
-# ENDPOINT 1: SUBIDA Y EXTRACCIÓN
+# ENDPOINT 1: SUBIDA Y EXTRACCIÓN CON IA
 # ==========================================
 @app.post("/api/procesar-factura")
 async def procesar_factura(
     archivo: UploadFile = File(...),
-    id_usuario: int = Form(...), # Next.js inyectará esto de forma segura
+    id_usuario: int = Form(...),
     api_key: str = Depends(verify_api_key)
 ):
     if not archivo.filename.lower().endswith('.pdf'):
         raise HTTPException(status_code=400, detail="El archivo debe ser un PDF")
 
     try:
+        # 1. Leer y rasterizar PDF
         contenido_pdf = await archivo.read()
         documento = fitz.open(stream=contenido_pdf, filetype="pdf")
         
@@ -65,6 +63,7 @@ async def procesar_factura(
             img_b64 = base64.b64encode(pixmap.tobytes("jpeg")).decode('utf-8')
             imagenes_base64.append(img_b64)
         documento.close()
+
 
         prompt = """
         Eres Vectia IA, un auditor financiero y energético experto en la normativa de servicios públicos de Colombia (CREG, CRA, SSPD).
@@ -112,10 +111,12 @@ async def procesar_factura(
         }
         """
 
+
         mensajes = [{"type": "text", "text": prompt}]
         for img in imagenes_base64:
             mensajes.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img}", "detail": "auto"}})
 
+        # 3. Invocación al LLM
         respuesta = await openai_client.chat.completions.create(
             model="gpt-4o-mini",
             response_format={"type": "json_object"},
@@ -125,6 +126,7 @@ async def procesar_factura(
 
         datos_extraidos = json.loads(respuesta.choices[0].message.content)
 
+        # 4. Inserción en Supabase
         datos_factura = datos_extraidos["factura"]
         datos_factura["id_usuario"] = id_usuario
         res_factura = supabase.table("facturas").insert(datos_factura).execute()
@@ -135,7 +137,14 @@ async def procesar_factura(
             for m in lista_medidores: m["id_factura"] = id_factura
             supabase.table("consumos_medidores").insert(lista_medidores).execute()
 
-        return {"status": "success", "id_factura": id_factura}
+        # 5. Respuesta para el Frontend (Necesario para el renombramiento de archivo inteligente)
+        return {
+            "status": "success", 
+            "id_factura": id_factura,
+            "proveedor": datos_factura.get("proveedor"),
+            "numero_factura": datos_factura.get("numero_factura"),
+            "detalles_adicionales": datos_factura.get("detalles_adicionales", {})
+        }
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -154,79 +163,3 @@ async def obtener_analiticas(
         return {"status": "success", "data": res.data}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-
-# ==========================================
-# ENDPOINT 3: GENERACIÓN DE INFORME PDF (Seguro)
-# ==========================================
-def limpiar_texto(texto):
-    """Limpia tildes y caracteres que rompen FPDF"""
-    if not texto: return "N/A"
-    reemplazos = {'á':'a', 'é':'e', 'í':'i', 'ó':'o', 'ú':'u', 'Á':'A', 'É':'E', 'Í':'I', 'Ó':'O', 'Ú':'U', 'ñ':'n', 'Ñ':'N'}
-    texto = str(texto)
-    for original, nuevo in reemplazos.items():
-        texto = texto.replace(original, nuevo)
-    # Ignora cualquier otro caracter extraño
-    return texto.encode('latin-1', 'ignore').decode('latin-1')
-
-@app.get("/api/informe-pdf")
-async def generar_informe_pdf(
-    id_usuario: int = Query(...), 
-    api_key: str = Depends(verify_api_key)
-):
-    try:
-        res = supabase.table("facturas").select("*, consumos_medidores(*)").eq("id_usuario", id_usuario).execute()
-        facturas = res.data
-
-        if not facturas:
-            raise HTTPException(status_code=404, detail="No hay datos para este usuario")
-
-        gasto_total = sum(f.get("valor_total", 0) for f in facturas)
-        total_sedes = len(set(f.get("direccion_sede") for f in facturas if f.get("direccion_sede")))
-
-        pdf = FPDF()
-        pdf.add_page()
-        pdf.set_font("Helvetica", style="B", size=20)
-        pdf.cell(0, 15, limpiar_texto("Reporte Analítico - Vectia Enterprise"), ln=True, align="C")
-        pdf.set_font("Helvetica", size=10)
-        pdf.cell(0, 10, f"Fecha de generacion: {datetime.now().strftime('%Y-%m-%d %H:%M')}", ln=True, align="C")
-        pdf.ln(10)
-
-        pdf.set_font("Helvetica", style="B", size=14)
-        pdf.cell(0, 10, "Resumen Financiero", ln=True)
-        pdf.set_font("Helvetica", size=12)
-        pdf.cell(0, 8, f"- Gasto Total Consolidado: ${gasto_total:,.2f} COP", ln=True)
-        pdf.cell(0, 8, f"- Sedes Analizadas: {total_sedes}", ln=True)
-        pdf.ln(10)
-
-        pdf.set_font("Helvetica", style="B", size=12)
-        pdf.cell(0, 10, "Desglose por Servicio", ln=True)
-        
-        pdf.set_font("Helvetica", style="B", size=9)
-        pdf.cell(30, 10, "Servicio", border=1)
-        pdf.cell(85, 10, "Direccion / Sede", border=1)
-        pdf.cell(35, 10, "Ciudad", border=1)
-        pdf.cell(40, 10, "Valor Total", border=1, ln=True)
-
-        pdf.set_font("Helvetica", size=9)
-        for f in facturas:
-            servicio = limpiar_texto(f.get("tipo_servicio", "N/A")).upper()
-            dir_sede = limpiar_texto(f.get("direccion_sede") or "No registrada")[:45] 
-            ciudad = limpiar_texto(f.get("ciudad") or "N/A")[:20]
-            valor = f"${f.get('valor_total', 0):,.2f}"
-
-            pdf.cell(30, 10, servicio, border=1)
-            pdf.cell(85, 10, dir_sede, border=1)
-            pdf.cell(35, 10, ciudad, border=1)
-            pdf.cell(40, 10, valor, border=1, ln=True)
-
-        pdf.ln(15)
-        pdf.set_font("Helvetica", style="I", size=10)
-        pdf.cell(0, 10, limpiar_texto("Generado automáticamente por Inteligencia Artificial Vectia."), ln=True, align="C")
-
-        pdf_bytes = pdf.output(dest="S").encode("latin-1")
-        return Response(content=pdf_bytes, media_type="application/pdf", headers={"Content-Disposition": "attachment; filename=informe_vectia.pdf"})
-
-    except Exception as e:
-        print(f"Error PDF: {e}")
-        raise HTTPException(status_code=500, detail="Error interno generando el informe PDF")
