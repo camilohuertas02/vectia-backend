@@ -5,6 +5,7 @@ from anthropic import AsyncAnthropic
 from supabase import create_client, Client
 import fitz  # PyMuPDF
 import base64
+import json
 import os
 
 app = FastAPI()
@@ -54,7 +55,7 @@ async def procesar_factura(
             imagenes_base64.append(img_b64)
         documento.close()
 
-        # MEGA-PROMPT DE AUDITORÍA (MÓDULO B2B ENTERPRISE)
+        # MEGA-PROMPT DE AUDITORÍA ORIGINAL (MÓDULO B2B ENTERPRISE)
         prompt_sistema = """
         Eres Vectia IA, un auditor financiero, energético y normativo experto en servicios públicos de Colombia (CREG, CRA, SSPD).
         Analiza las imágenes de la factura provista y extrae la información cumpliendo ESTRICTAMENTE estas reglas. 
@@ -74,7 +75,7 @@ async def procesar_factura(
 
         EXTRACCIÓN OPERATIVA:
         - "dias_facturados": Busca "Días facturados", "Días de consumo", o calcula la diferencia entre lectura actual y anterior si aplica. Número entero.
-        - "numero_factura": El consecutivo fiscal.
+        - "numero_factura": El consecutivo fiscal (Ej: DOCUMENTO EQUIVALENTE No. 399...).
         - "numero_cliente": El NIC, Cuenta, o Número de Cliente.
         - "periodo_inicio" y "periodo_fin": Formato "YYYY-MM-DD".
 
@@ -84,6 +85,37 @@ async def procesar_factura(
         - "costo_contribucion_solidaridad_cop": Recargo estipulado por Ley 142 para estratos comerciales/industriales.
         - "costo_aseo_cop": El valor facturado exclusivamente por aseo/recolección de basura.
         - "costo_alumbrado_publico_cop": El valor por alumbrado público.
+
+        DEVUELVE ÚNICAMENTE UN JSON CON LA SIGUIENTE ESTRUCTURA ESTRICTA:
+        {
+          "factura": {
+            "tipo_servicio": "energia",
+            "proveedor": "Enel Colombia",
+            "numero_factura": "string",
+            "numero_cliente": "string",
+            "direccion_sede": "string",
+            "ciudad": "string",
+            "dias_facturados": 30,
+            "costo_servicio_core": 0.0,
+            "cargos_terceros": 0.0,
+            "valor_total": 0.0,
+            "periodo_inicio": "YYYY-MM-DD",
+            "periodo_fin": "YYYY-MM-DD",
+            "detalles_adicionales": {
+                "costo_energia_reactiva_cop": 0.0,
+                "costo_contribucion_solidaridad_cop": 0.0,
+                "costo_aseo_cop": 0.0,
+                "costo_alumbrado_publico_cop": 0.0
+            }
+          },
+          "medidores": [
+            {
+              "numero_medidor": "string o 'MED-UNICO'",
+              "consumo": 0.0,
+              "unidad_medida": "kWh"
+            }
+          ]
+        }
         """
 
         contenido_mensaje = []
@@ -154,14 +186,14 @@ async def procesar_factura(
             }
         }
 
-        # Ejecución Claude Sonnet 5.5 sin prefill y con Tool Choice forzado
+        # Ejecución Claude Sonnet 5.5 (Dejando que el modelo use la herramienta en modo "auto")
         respuesta = await anthropic_client.messages.create(
             model="claude-sonnet-5-5",
             max_tokens=2500,
             system=prompt_sistema,
             tools=[esquema_herramienta],
             messages=[
-                {"role": "user", "content": contenido_mensaje} # El flujo termina limpiamente en el usuario
+                {"role": "user", "content": contenido_mensaje} 
             ]
         )
 
@@ -188,16 +220,18 @@ async def procesar_factura(
                 m["id_factura"] = id_factura
             supabase.table("consumos_medidores").insert(lista_medidores).execute()
 
+        # CONTRATO CON EL FRONTEND RESTAURADO
         return {
             "status": "success", 
             "id_factura": id_factura,
             "proveedor": datos_factura.get("proveedor"),
+            "numero_factura": datos_factura.get("numero_factura"), 
+            "detalles_adicionales": datos_factura.get("detalles_adicionales", {}), 
             "kpis_financieros": {
                 "core": datos_factura.get("costo_servicio_core"),
                 "terceros": datos_factura.get("cargos_terceros"),
                 "total": datos_factura.get("valor_total")
-            },
-            "alertas_financieras": datos_factura.get("detalles_adicionales", {})
+            }
         }
 
     except Exception as e:
