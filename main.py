@@ -160,7 +160,6 @@ async def procesar_factura(
             max_tokens=2500,
             system=prompt_sistema,
             tools=[esquema_herramienta],
-            tool_choice={"type": "tool", "name": "registrar_datos_factura"}, # <--- OBLIGA A RETORNAR SOLO EL JSON
             messages=[
                 {"role": "user", "content": contenido_mensaje} # El flujo termina limpiamente en el usuario
             ]
