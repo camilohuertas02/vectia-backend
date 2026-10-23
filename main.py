@@ -141,7 +141,7 @@ async def procesar_factura(
 
        # Ejecución Claude 3.5 Sonnet con técnica de Prefill (JSON forzado)
         respuesta = await anthropic_client.messages.create(
-            model="claude-3-5-sonnet-latest",
+            model="claude-3-5-sonnet-20240620",
             max_tokens=2500,
             system=prompt_sistema,
             messages=[
