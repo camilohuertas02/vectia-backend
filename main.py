@@ -139,7 +139,7 @@ async def procesar_factura(
         respuesta = await anthropic_client.messages.create(
             model="claude-3-5-sonnet-20241022",
             max_tokens=2500,
-            temperature=0.0,
+            extra_body={"temperature": 0.0},
             system=prompt_sistema,
             messages=[{"role": "user", "content": contenido_mensaje}]
         )
