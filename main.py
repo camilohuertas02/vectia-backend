@@ -135,16 +135,21 @@ async def procesar_factura(
             "text": "Procesa la factura y devuelve EXCLUSIVAMENTE el objeto JSON estructurado."
         })
 
-        # Ejecución Claude 3.5 Sonnet
+       # Ejecución Claude 3.5 Sonnet con técnica de Prefill (JSON forzado)
         respuesta = await anthropic_client.messages.create(
             model="claude-3-5-sonnet-20241022",
             max_tokens=2500,
-            temperature=0.0,
             system=prompt_sistema,
-            messages=[{"role": "user", "content": contenido_mensaje}]
+            messages=[
+                {"role": "user", "content": contenido_mensaje},
+                {"role": "assistant", "content": "{"} # <-- PREFILL: Obliga al modelo a iniciar directamente en formato JSON
+            ]
         )
 
-        texto_crudo = respuesta.content[0].text
+        # Reconstruimos el JSON añadiendo la llave inicial que inyectamos
+        texto_crudo = "{" + respuesta.content[0].text
+        
+        # Limpieza de posibles cierres de formato markdown
         texto_json = re.sub(r'```(?:json)?|```', '', texto_crudo).strip()
         
         datos_extraidos = json.loads(texto_json)
