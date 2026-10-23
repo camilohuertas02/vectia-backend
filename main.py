@@ -5,9 +5,7 @@ from anthropic import AsyncAnthropic
 from supabase import create_client, Client
 import fitz  # PyMuPDF
 import base64
-import json
 import os
-import re
 
 app = FastAPI()
 
@@ -76,7 +74,7 @@ async def procesar_factura(
 
         EXTRACCIÓN OPERATIVA:
         - "dias_facturados": Busca "Días facturados", "Días de consumo", o calcula la diferencia entre lectura actual y anterior si aplica. Número entero.
-        - "numero_factura": El consecutivo fiscal (Ej: DOCUMENTO EQUIVALENTE No. 399...).
+        - "numero_factura": El consecutivo fiscal.
         - "numero_cliente": El NIC, Cuenta, o Número de Cliente.
         - "periodo_inicio" y "periodo_fin": Formato "YYYY-MM-DD".
 
@@ -86,37 +84,6 @@ async def procesar_factura(
         - "costo_contribucion_solidaridad_cop": Recargo estipulado por Ley 142 para estratos comerciales/industriales.
         - "costo_aseo_cop": El valor facturado exclusivamente por aseo/recolección de basura.
         - "costo_alumbrado_publico_cop": El valor por alumbrado público.
-
-        DEVUELVE ÚNICAMENTE UN JSON CON LA SIGUIENTE ESTRUCTURA ESTRICTA:
-        {
-          "factura": {
-            "tipo_servicio": "energia",
-            "proveedor": "Enel Colombia",
-            "numero_factura": "string",
-            "numero_cliente": "string",
-            "direccion_sede": "string",
-            "ciudad": "string",
-            "dias_facturados": 30,
-            "costo_servicio_core": 0.0,
-            "cargos_terceros": 0.0,
-            "valor_total": 0.0,
-            "periodo_inicio": "YYYY-MM-DD",
-            "periodo_fin": "YYYY-MM-DD",
-            "detalles_adicionales": {
-                "costo_energia_reactiva_cop": 0.0,
-                "costo_contribucion_solidaridad_cop": 0.0,
-                "costo_aseo_cop": 0.0,
-                "costo_alumbrado_publico_cop": 0.0
-            }
-          },
-          "medidores": [
-            {
-              "numero_medidor": "string o 'MED-UNICO'",
-              "consumo": 0.0,
-              "unidad_medida": "kWh"
-            }
-          ]
-        }
         """
 
         contenido_mensaje = []
@@ -132,37 +99,87 @@ async def procesar_factura(
         
         contenido_mensaje.append({
             "type": "text",
-            "text": "Procesa la factura y devuelve EXCLUSIVAMENTE el objeto JSON estructurado."
+            "text": "Procesa las imágenes del recibo y registra los datos invocando la herramienta obligatoria."
         })
 
-        # PREFILL AVANZADO: Inyectamos la primera estructura clave para destruir cualquier intento de Markdown externo.
-        prefill_string = "{\n  \"factura\": {"
+        # ESQUEMA DE HERRAMIENTA NATIVA PARA FORZAR JSON PERFECTO
+        esquema_herramienta = {
+            "name": "registrar_datos_factura",
+            "description": "Guarda de manera estructurada los campos auditados del recibo de servicios públicos.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "factura": {
+                        "type": "object",
+                        "properties": {
+                            "tipo_servicio": {"type": "string", "enum": ["energia", "agua", "gas"]},
+                            "proveedor": {"type": "string"},
+                            "numero_factura": {"type": "string"},
+                            "numero_cliente": {"type": "string"},
+                            "direccion_sede": {"type": "string"},
+                            "ciudad": {"type": "string"},
+                            "dias_facturados": {"type": "integer"},
+                            "costo_servicio_core": {"type": "number"},
+                            "cargos_terceros": {"type": "number"},
+                            "valor_total": {"type": "number"},
+                            "periodo_inicio": {"type": "string"},
+                            "periodo_fin": {"type": "string"},
+                            "detalles_adicionales": {
+                                "type": "object",
+                                "properties": {
+                                    "costo_energia_reactiva_cop": {"type": "number"},
+                                    "costo_contribucion_solidaridad_cop": {"type": "number"},
+                                    "costo_aseo_cop": {"type": "number"},
+                                    "costo_alumbrado_publico_cop": {"type": "number"}
+                                },
+                                "required": ["costo_energia_reactiva_cop", "costo_contribucion_solidaridad_cop", "costo_aseo_cop", "costo_alumbrado_publico_cop"]
+                            }
+                        },
+                        "required": ["tipo_servicio", "proveedor", "numero_factura", "numero_cliente", "direccion_sede", "ciudad", "dias_facturados", "costo_servicio_core", "cargos_terceros", "valor_total", "periodo_inicio", "periodo_fin", "detalles_adicionales"]
+                    },
+                    "medidores": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "numero_medidor": {"type": "string"},
+                                "consumo": {"type": "number"},
+                                "unidad_medida": {"type": "string"}
+                            },
+                            "required": ["numero_medidor", "consumo", "unidad_medida"]
+                        }
+                    }
+                },
+                "required": ["factura", "medidores"]
+            }
+        }
 
-
-       # Ejecución Claude 3.5 Sonnet con técnica de Prefill (JSON forzado)
+        # Ejecución Claude Sonnet 5.5 sin prefill y con Tool Choice forzado
         respuesta = await anthropic_client.messages.create(
             model="claude-sonnet-5-5",
             max_tokens=2500,
-            thinking={"type": "between_tools"},
             system=prompt_sistema,
+            tools=[esquema_herramienta],
+            tool_choice={"type": "tool", "name": "registrar_datos_factura"}, # <--- OBLIGA A RETORNAR SOLO EL JSON
             messages=[
-                {"role": "user", "content": contenido_mensaje},
-                {"role": "assistant", "content": prefill_string}
+                {"role": "user", "content": contenido_mensaje} # El flujo termina limpiamente en el usuario
             ]
         )
 
-        # Reconstruimos el JSON añadiendo la llave inicial que inyectamos
-        texto_crudo = prefill_string + respuesta.content[0].text
-        
-        texto_json = re.sub(r'```(?:json)?|```', '', texto_crudo).strip()
-        
-        datos_extraidos = json.loads(texto_json)
+        # Extracción directa del JSON nativo del bloque de uso de herramientas
+        datos_extraidos = None
+        for block in respuesta.content:
+            if block.type == "tool_use":
+                datos_extraidos = block.input
+                break
+
+        if not datos_extraidos:
+            raise HTTPException(status_code=500, detail="El modelo no invocó la estructura de datos requerida.")
 
         # Inserción en Base de Datos
         datos_factura = datos_extraidos["factura"]
         datos_factura["id_usuario"] = id_usuario
         
-        # Validar y limpiar campos si es necesario a nivel Python
         res_factura = supabase.table("facturas").insert(datos_factura).execute()
         id_factura = res_factura.data[0]["id"]
 
@@ -193,7 +210,6 @@ async def obtener_analiticas(
     api_key: str = Depends(verify_api_key)
 ):
     try:
-        # Traemos toda la data de facturas y los medidores asociados
         res = supabase.table("facturas").select("*, consumos_medidores(*)").eq("id_usuario", id_usuario).execute()
         return {"status": "success", "data": res.data}
     except Exception as e:
