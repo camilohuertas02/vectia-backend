@@ -1,6 +1,8 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Form, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader
+from pydantic import BaseModel
+from typing import Optional, List
 from anthropic import AsyncAnthropic
 from supabase import create_client, Client
 import fitz  # PyMuPDF
@@ -38,6 +40,7 @@ async def verify_api_key(api_key: str = Depends(api_key_header)):
 async def procesar_factura(
     archivo: UploadFile = File(...),
     id_usuario: int = Form(...),
+    team_id: Optional[int] = Form(None),
     api_key: str = Depends(verify_api_key)
 ):
     if not archivo.filename.lower().endswith('.pdf'):
@@ -207,9 +210,11 @@ async def procesar_factura(
         if not datos_extraidos:
             raise HTTPException(status_code=500, detail="El modelo no invocó la estructura de datos requerida.")
 
-        # Inserción en Base de Datos
+        # Inserción en Base de Datos (Guardando tanto id_usuario como team_id)
         datos_factura = datos_extraidos["factura"]
         datos_factura["id_usuario"] = id_usuario
+        if team_id is not None:
+            datos_factura["team_id"] = team_id
         
         res_factura = supabase.table("facturas").insert(datos_factura).execute()
         id_factura = res_factura.data[0]["id"]
@@ -237,13 +242,186 @@ async def procesar_factura(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+def consultar_facturas_equipo_o_usuario(id_usuario: int, team_id: Optional[int] = None):
+    """
+    Devuelve todas las facturas que pertenecen al team_id de la organización
+    o al id_usuario (para compatibilidad total entre miembros del mismo equipo).
+    """
+    query = supabase.table("facturas").select("*, consumos_medidores(*)")
+    if team_id is not None:
+        query = query.or_(f"team_id.eq.{team_id},id_usuario.eq.{id_usuario}")
+    else:
+        query = query.eq("id_usuario", id_usuario)
+    return query.order("periodo_fin", desc=True).execute()
+
+
 @app.get("/api/analytics")
 async def obtener_analiticas(
-    id_usuario: int = Query(...), 
+    id_usuario: int = Query(...),
+    team_id: Optional[int] = Query(None),
     api_key: str = Depends(verify_api_key)
 ):
     try:
-        res = supabase.table("facturas").select("*, consumos_medidores(*)").eq("id_usuario", id_usuario).execute()
+        res = consultar_facturas_equipo_o_usuario(id_usuario=id_usuario, team_id=team_id)
         return {"status": "success", "data": res.data}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==========================================
+# ENDPOINT DEL ASISTENTE ANALÍTICO VECTIA IA
+# ==========================================
+class ChatHistoryItem(BaseModel):
+    role: str
+    content: str
+
+class ChatQueryRequest(BaseModel):
+    id_usuario: int
+    team_id: Optional[int] = None
+    pregunta: str
+    historial: Optional[List[ChatHistoryItem]] = []
+
+@app.post("/api/chat")
+async def asistente_analitico_chat(
+    payload: ChatQueryRequest,
+    api_key: str = Depends(verify_api_key)
+):
+    try:
+        res = consultar_facturas_equipo_o_usuario(
+            id_usuario=payload.id_usuario,
+            team_id=payload.team_id
+        )
+        facturas_db = res.data or []
+
+        if len(facturas_db) == 0:
+            return {
+                "status": "success",
+                "respuesta": "Actualmente tu organización no tiene facturas procesadas en la base de datos. Sube tus primeros recibos en la sección 'Subir facturas' para que pueda analizarlos y responder tus preguntas.",
+                "total_facturas_contexto": 0
+            }
+
+        # Pre-calculamos un resumen agregado exacto y estructuramos cada factura para Claude
+        resumen_global = {
+            "total_facturas_analizadas": len(facturas_db),
+            "gasto_total_cop": 0.0,
+            "costo_neto_core_cop": 0.0,
+            "cargos_terceros_cop": 0.0,
+            "total_energia_reactiva_cop": 0.0,
+            "total_contribucion_solidaridad_cop": 0.0,
+            "total_aseo_cop": 0.0,
+            "total_alumbrado_publico_cop": 0.0,
+            "consumo_energia_kwh": 0.0,
+            "consumo_agua_m3": 0.0,
+            "consumo_gas_m3": 0.0,
+            "huella_carbono_ton_co2e": 0.0
+        }
+
+        facturas_limpias = []
+        for f in facturas_db:
+            val_total = float(f.get("valor_total") or 0)
+            val_core = float(f.get("costo_servicio_core") or 0)
+            val_terceros = float(f.get("cargos_terceros") or 0)
+            detalles = f.get("detalles_adicionales") or {}
+
+            reactiva = float(detalles.get("costo_energia_reactiva_cop") or 0)
+            solidaridad = float(detalles.get("costo_contribucion_solidaridad_cop") or 0)
+            aseo = float(detalles.get("costo_aseo_cop") or 0)
+            alumbrado = float(detalles.get("costo_alumbrado_publico_cop") or 0)
+
+            resumen_global["gasto_total_cop"] += val_total
+            resumen_global["costo_neto_core_cop"] += val_core
+            resumen_global["cargos_terceros_cop"] += val_terceros
+            resumen_global["total_energia_reactiva_cop"] += reactiva
+            resumen_global["total_contribucion_solidaridad_cop"] += solidaridad
+            resumen_global["total_aseo_cop"] += aseo
+            resumen_global["total_alumbrado_publico_cop"] += alumbrado
+
+            medidores_f = f.get("consumos_medidores") or []
+            consumo_f = sum(float(m.get("consumo") or 0) for m in medidores_f)
+            servicio = f.get("tipo_servicio") or "energia"
+
+            if servicio == "energia":
+                resumen_global["consumo_energia_kwh"] += consumo_f
+                resumen_global["huella_carbono_ton_co2e"] += (consumo_f * 0.164) / 1000.0
+            elif servicio == "agua":
+                resumen_global["consumo_agua_m3"] += consumo_f
+                resumen_global["huella_carbono_ton_co2e"] += (consumo_f * 0.3) / 1000.0
+            elif servicio == "gas":
+                resumen_global["consumo_gas_m3"] += consumo_f
+                resumen_global["huella_carbono_ton_co2e"] += (consumo_f * 2.02) / 1000.0
+
+            facturas_limpias.append({
+                "id": f.get("id"),
+                "servicio": servicio,
+                "proveedor": f.get("proveedor"),
+                "numero_factura": f.get("numero_factura"),
+                "cuenta_nic": f.get("numero_cliente"),
+                "sede": f.get("direccion_sede"),
+                "ciudad": f.get("ciudad"),
+                "periodo_inicio": f.get("periodo_inicio"),
+                "periodo_fin": f.get("periodo_fin"),
+                "dias_facturados": f.get("dias_facturados"),
+                "costo_neto_core_cop": val_core,
+                "cargos_terceros_cop": val_terceros,
+                "valor_total_cop": val_total,
+                "energia_reactiva_cop": reactiva,
+                "contribucion_solidaridad_cop": solidaridad,
+                "aseo_cop": aseo,
+                "alumbrado_publico_cop": alumbrado,
+                "medidores": [
+                    {
+                        "medidor": m.get("numero_medidor"),
+                        "consumo": float(m.get("consumo") or 0),
+                        "unidad": m.get("unidad_medida")
+                    }
+                    for m in medidores_f
+                ]
+            })
+
+        prompt_asistente = f"""
+        Eres el Asistente Analítico Vectia IA, un consultor experto en análisis financiero, energético y regulatorio de servicios públicos en Colombia (CREG 015, Ley 142, huella de carbono GHG Protocol).
+        Tienes acceso en tiempo real a la totalidad de las facturas procesadas de la empresa del usuario.
+
+        REGLAS DE RESPUESTA:
+        1. Responde SIEMPRE en español, con tono ejecutivo, directo, claro y preciso.
+        2. Basa tus cálculos ÚNICAMENTE en los datos reales provistos a continuación. Nunca inventes facturas ni cifras.
+        3. Formatea todos los valores monetarios en Pesos Colombianos (ej: $1.450.000 COP) y los consumos con su unidad (kWh o m³).
+        4. Cuando menciones una factura específica, indica el proveedor, la sede, el número de factura o cuenta NIC y el periodo para que el usuario pueda ubicarla fácilmente.
+        5. Usa listas con viñetas y negritas para que la lectura sea ágil.
+
+        RESUMEN CONSOLIDADO DE LA ORGANIZACIÓN:
+        {json.dumps(resumen_global, ensure_ascii=False)}
+
+        DETALLE COMPLETO DE FACTURAS DE LA ORGANIZACIÓN:
+        {json.dumps(facturas_limpias, ensure_ascii=False)}
+        """
+
+        mensajes_claude = []
+        if payload.historial:
+            for item in payload.historial[-8:]:
+                rol = "assistant" if item.role == "assistant" else "user"
+                mensajes_claude.append({"role": rol, "content": item.content})
+
+        mensajes_claude.append({"role": "user", "content": payload.pregunta})
+
+        respuesta_ia = await anthropic_client.messages.create(
+            model="claude-sonnet-5-5",
+            max_tokens=1500,
+            system=prompt_asistente,
+            messages=mensajes_claude
+        )
+
+        texto_respuesta = ""
+        for block in respuesta_ia.content:
+            if block.type == "text":
+                texto_respuesta += block.text
+
+        return {
+            "status": "success",
+            "respuesta": texto_respuesta,
+            "total_facturas_contexto": len(facturas_db)
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error en Asistente Analítico: {str(e)}")
