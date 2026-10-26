@@ -47,7 +47,6 @@ async def procesar_factura(
         raise HTTPException(status_code=400, detail="El archivo debe ser un PDF")
 
     try:
-        # Renderizado a 150 DPI para precisión visual absoluta
         contenido_pdf = await archivo.read()
         documento = fitz.open(stream=contenido_pdf, filetype="pdf")
         
@@ -137,7 +136,6 @@ async def procesar_factura(
             "text": "Procesa las imágenes del recibo y registra los datos invocando la herramienta obligatoria."
         })
 
-        # ESQUEMA DE HERRAMIENTA NATIVA PARA FORZAR JSON PERFECTO
         esquema_herramienta = {
             "name": "registrar_datos_factura",
             "description": "Guarda de manera estructurada los campos auditados del recibo de servicios públicos.",
@@ -189,7 +187,6 @@ async def procesar_factura(
             }
         }
 
-        # Ejecución Claude Sonnet 5.5 (Dejando que el modelo use la herramienta en modo "auto")
         respuesta = await anthropic_client.messages.create(
             model="claude-sonnet-5-5",
             max_tokens=2500,
@@ -200,7 +197,6 @@ async def procesar_factura(
             ]
         )
 
-        # Extracción directa del JSON nativo del bloque de uso de herramientas
         datos_extraidos = None
         for block in respuesta.content:
             if block.type == "tool_use":
@@ -210,7 +206,6 @@ async def procesar_factura(
         if not datos_extraidos:
             raise HTTPException(status_code=500, detail="El modelo no invocó la estructura de datos requerida.")
 
-        # Inserción en Base de Datos (Guardando tanto id_usuario como team_id)
         datos_factura = datos_extraidos["factura"]
         datos_factura["id_usuario"] = id_usuario
         if team_id is not None:
@@ -225,7 +220,6 @@ async def procesar_factura(
                 m["id_factura"] = id_factura
             supabase.table("consumos_medidores").insert(lista_medidores).execute()
 
-        # CONTRATO CON EL FRONTEND RESTAURADO
         return {
             "status": "success", 
             "id_factura": id_factura,
@@ -244,10 +238,6 @@ async def procesar_factura(
 
 
 def consultar_facturas_equipo_o_usuario(id_usuario: int, team_id: Optional[int] = None):
-    """
-    Devuelve todas las facturas que pertenecen al team_id de la organización
-    o al id_usuario (para compatibilidad total entre miembros del mismo equipo).
-    """
     query = supabase.table("facturas").select("*, consumos_medidores(*)")
     if team_id is not None:
         query = query.or_(f"team_id.eq.{team_id},id_usuario.eq.{id_usuario}")
@@ -269,9 +259,6 @@ async def obtener_analiticas(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ==========================================
-# ENDPOINT DEL ASISTENTE ANALÍTICO VECTIA IA
-# ==========================================
 class ChatHistoryItem(BaseModel):
     role: str
     content: str
@@ -294,14 +281,6 @@ async def asistente_analitico_chat(
         )
         facturas_db = res.data or []
 
-        if len(facturas_db) == 0:
-            return {
-                "status": "success",
-                "respuesta": "Actualmente tu organización no tiene facturas procesadas en la base de datos. Sube tus primeros recibos en la sección 'Subir facturas' para que pueda analizarlos y responder tus preguntas.",
-                "total_facturas_contexto": 0
-            }
-
-        # Pre-calculamos un resumen agregado exacto y estructuramos cada factura para Claude
         resumen_global = {
             "total_facturas_analizadas": len(facturas_db),
             "gasto_total_cop": 0.0,
@@ -380,20 +359,34 @@ async def asistente_analitico_chat(
             })
 
         prompt_asistente = f"""
-        Eres el Asistente Analítico Vectia IA, un consultor experto en análisis financiero, energético y regulatorio de servicios públicos en Colombia (CREG 015, Ley 142, huella de carbono GHG Protocol).
-        Tienes acceso en tiempo real a la totalidad de las facturas procesadas de la empresa del usuario.
+        Eres el Asistente Analítico y Normativo de Vectia IA, especializado en análisis financiero de facturación y regulación colombiana de servicios públicos domiciliarios.
 
-        REGLAS DE RESPUESTA:
-        1. Responde SIEMPRE en español, con tono ejecutivo, directo, claro y preciso.
-        2. Basa tus cálculos ÚNICAMENTE en los datos reales provistos a continuación. Nunca inventes facturas ni cifras.
-        3. Formatea todos los valores monetarios en Pesos Colombianos (ej: $1.450.000 COP) y los consumos con su unidad (kWh o m³).
-        4. Cuando menciones una factura específica, indica el proveedor, la sede, el número de factura o cuenta NIC y el periodo para que el usuario pueda ubicarla fácilmente.
-        5. Usa listas con viñetas y negritas para que la lectura sea ágil.
+        BASE DE CONOCIMIENTO NORMATIVO Y REGULATORIO COLOMBIANO:
+        1. Ley 142 de 1994 (Régimen de Servicios Públicos Domiciliarios):
+           - Art. 89: Regula la Contribución de Solidaridad (sobreprecio hasta del 20% para usuarios industriales y comerciales destinado a subsidiar estratos 1, 2 y 3).
+           - Art. 146: Derecho a la medición real del consumo; prohíbe cobrar por promedio salvo imposibilidad técnica temporal justificada.
+           - Art. 150: Límite de 5 meses para cobros inoportunos o retroactivos por error u omisión de la empresa prestadora.
+           - Arts. 152 a 158: Derecho de Petición en interés particular y Recursos de Reposición (ante el operador) y en Subsidio de Apelación (ante la Superintendencia de Servicios Públicos Domiciliarios - SSPD). El operador tiene 15 días hábiles para responder (Silencio Administrativo Positivo si no responde en término).
+        2. Exención de Contribución de Solidaridad (20%) en Energía y Gas:
+           - Normativa: Artículo 211 del Estatuto Tributario (modificado por Ley 1430 de 2010), Decreto 2860 de 2013 y Decreto 1625 de 2016.
+           - Usuarios industriales cuya actividad económica principal en el RUT corresponda a los códigos CIIU de las Divisiones 01 a 36 (agroindustria, minería, manufactura) o 41 a 43 (construcción) tienen derecho a la EXENCIÓN del 20% de contribución de solidaridad en energía eléctrica y gas natural, radicando el RUT actualizado (con menos de 30 días de expedición) y solicitud formal ante el comercializador.
+        3. Resolución CREG 015 de 2018 (Capítulo 12 - Energía Reactiva):
+           - Se penaliza el transporte de energía reactiva inductiva cuando supera el 50% de la energía activa (kWh) consumida en el periodo, y toda la energía reactiva capacitiva inyectada a la red.
+           - Factor Multiplicador M: Si el exceso persiste por más de 12 meses, el factor M aumenta progresivamente de M=1 hasta M=6 (mes a mes) y de M=6 a M=12 (anualmente), multiplicando la tarifa de distribución. Solución técnica: compensación mediante bancos de condensadores automáticos o filtros activos.
+        4. Acueducto, Alcantarillado y Aseo (Regulación CRA - Resolución CRA 943 de 2021):
+           - Desviaciones Significativas de Consumo (Art. 1.13.1.6 CRA 943): El operador está obligado a investigar previamente en sitio antes de facturar un incremento anormal del consumo (fugas ocultas o perceptibles).
+           - Tasa de Aseo y Alumbrado Público: Son cargos recaudados conjuntamente en la factura pero regulados por tarifas municipales/distritales (Ley 1819 de 2016 para Impuesto de Alumbrado Público).
+
+        REGLAS DE FORMATO Y RESPUESTA:
+        1. Usa párrafos separados por saltos de línea claros y viñetas simples (-).
+        2. Cuando uses negritas (**texto**), cierra siempre los dos asteriscos correctamente.
+        3. Cita las cifras exactas en Pesos Colombianos ($ COP) y unidades (kWh, m³) de las facturas del usuario.
+        4. ALCANCE LEGAL: Cuando des orientación regulatoria o de reclamación, incluye al final una breve nota aclarando que se trata de orientación técnica y normativa basada en la regulación colombiana vigente y no sustituye el concepto formal de un abogado o apoderado jurídico.
 
         RESUMEN CONSOLIDADO DE LA ORGANIZACIÓN:
         {json.dumps(resumen_global, ensure_ascii=False)}
 
-        DETALLE COMPLETO DE FACTURAS DE LA ORGANIZACIÓN:
+        DETALLE DE FACTURAS DE LA ORGANIZACIÓN:
         {json.dumps(facturas_limpias, ensure_ascii=False)}
         """
 
