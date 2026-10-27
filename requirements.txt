@@ -13,6 +13,7 @@ fastapi==0.156.2
 flatbuffers==25.12.19
 fonttools==4.67.0
 fpdf2==2.8.9
+gunicorn==26.2.0
 h11==0.16.0
 h2==4.4.1
 hpack==4.2.0
